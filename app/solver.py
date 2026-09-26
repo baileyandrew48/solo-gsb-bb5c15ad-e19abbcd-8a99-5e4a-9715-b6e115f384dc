@@ -21,6 +21,11 @@
 source=inferred 帧的指派帧号合并去重为复扫目标，再划分成互不重叠、
 长度受限的连续帧号窗口，按总成本、窗口数、起止点序列依次裁决。
 
+歧义核验（:func:`solve_ambiguity_review`）接收与逐帧复核相同的输入，
+在同一套代价规则下同时计算后缀 DP 与前缀 DP，枚举每个扫描帧在**所有**
+全局最优合法序列中可取的帧号（而不是只回溯字典序首解），供人工核验
+帧号尚不能唯一确定的扫描帧。
+
 实现思路
 --------
 令 span = last - first，第 i 帧（0-based）指派到 first + d_i。
@@ -360,6 +365,8 @@ def _solve_assignment(
         "n": n,
         "parsed": parsed,
         "best_by_frame": best_by_frame,
+        "hit_costs": hit_costs,
+        "layers": layers,
         "offsets": offsets,
         "total_cost": total_cost,
         "cost_scale": scale,
@@ -538,6 +545,144 @@ def solve_review(payload: dict[str, Any]) -> dict[str, Any]:
         "missing_frame_count": len(missing_frame_numbers),
         "discarded_candidate_count": total_discarded,
         "frames": result_frames,
+    }
+
+
+def _prefix_layers(solution: dict[str, Any]) -> list[dict[int, int]]:
+    """计算前缀 DP：prefix[i][d] = 第 0..i 帧且第 i 帧取 offset d 时的最小总代价。
+
+    与后缀 DP（``_solve_assignment`` 中的 layers）同构，扫描方向相反：
+    按 d 从小到大扫描，用单调队列维护窗口 [d-max_step, d-1] 内
+    ``dp[i-1][d'] - 30*d'`` 的最小值。只保留能从固定首帧 (offset=0)
+    合法抵达的 offset。
+    """
+    n = solution["n"]
+    span = solution["span"]
+    max_step = solution["gap"] + 1
+    hit_costs = solution["hit_costs"]
+    penalty_scaled = MISSING_FRAME_PENALTY * solution["cost_scale"]
+    infer_cost_scaled = int(INFER_COST * solution["cost_scale"])
+
+    def match_cost(i: int, d: int) -> int:
+        return hit_costs[i].get(solution["first"] + d, infer_cost_scaled)
+
+    prefix: list[dict[int, int]] = [dict() for _ in range(n)]
+    # 第一帧必须指派 first（offset = 0）
+    prefix[0][0] = match_cost(0, 0)
+
+    for i in range(1, n):
+        layer: dict[int, int] = {}
+        # 单调队列元素 (offset, key)，按 d 从小到大扫描：
+        # - 新 offset（较大）从队尾加入，超窗的小 offset 从队首淘汰；
+        # - key = dp[i-1][offset] - 30*offset，队首到队尾严格递增，
+        #   队首即窗口 [d-max_step, d-1] 最小值。
+        queue: deque[tuple[int, int]] = deque()
+        prev_layer = prefix[i - 1]
+        for d in range(1, span + 1):
+            added = d - 1
+            prefix_cost = prev_layer.get(added)
+            if prefix_cost is not None:
+                key = prefix_cost - penalty_scaled * added
+                while queue and queue[-1][1] >= key:
+                    queue.pop()
+                queue.append((added, key))
+            # 窗口下界为 d - max_step，丢掉 offset 过小的队首
+            if queue and queue[0][0] < d - max_step:
+                queue.popleft()
+            if queue:
+                # 队首 key + 30*(d-1) 即为最优前驱带来的代价
+                best_transition = queue[0][1] + penalty_scaled * (d - 1)
+                layer[d] = match_cost(i, d) + best_transition
+        prefix[i] = layer
+    return prefix
+
+
+def solve_ambiguity_review(payload: dict[str, Any]) -> dict[str, Any]:
+    """执行帧号歧义核验。
+
+    入参与 :func:`solve_review` 完全相同。在固定首末帧、相邻缺帧上限与
+    现有候选/缺帧代价规则下，返回全局最低总代价，以及每一扫描帧在
+    **所有**取得该最低代价的合法序列中可以取到的帧号（升序）。
+
+    后缀 DP 记作 S[i][d]（第 i 帧取 offset d 时第 i..n-1 帧的最小代价，
+    i 之前的缺帧代价不计入），前缀 DP 记作 P[i][d]（第 0..i 帧、第 i 帧
+    取 d 时的最小代价，转移中已计入 d_{i-1} -> d 的缺帧代价）。两侧在
+    第 i 帧的命中代价上重叠一次，故判定式为：
+
+        P[i][d] + S[i][d] - match_cost(i, d) == 全局最优总代价
+
+    该式成立当且仅当存在一条经过 (i, d) 的合法序列取得全局最优：取到达
+    (i, d) 的最优前缀与从 (i, d) 出发的最优后缀在该处拼接，前缀严格递增
+    到 d、后缀从 d 严格递增，拼接后仍是合法序列。代价经 cost_scale
+    放大为整数比较，严格保持小数精度，结论覆盖所有同分最优序列，不依赖
+    字典序裁决取到的单条最优序列。
+
+    无合法序列时沿用 NoFeasibleSequenceError（HTTP 422）。
+    """
+    frames = payload.get("frames")
+    if not isinstance(frames, list) or not (MIN_FRAMES <= len(frames) <= MAX_FRAMES):
+        raise InvalidRangeError(
+            f"frames 数量必须在 {MIN_FRAMES}～{MAX_FRAMES} 之间"
+        )
+
+    first, last, gap = _validate_endpoints(payload)
+    parsed = _parse_frames(frames)
+    solution = _solve_assignment(first, last, gap, parsed)
+
+    n = solution["n"]
+    span = solution["span"]
+    total_cost = solution["total_cost"]
+    scale = solution["cost_scale"]
+    layers = solution["layers"]
+    prefix = _prefix_layers(solution)
+
+    infer_cost_scaled = int(INFER_COST * scale)
+
+    def match_cost(i: int, d: int) -> int:
+        return solution["hit_costs"][i].get(first + d, infer_cost_scaled)
+
+    # 防御性断言：两侧 DP 在固定首末帧与总代价上一致
+    assert prefix[0] == {0: match_cost(0, 0)}
+    assert total_cost == layers[0][0]
+    assert total_cost == prefix[n - 1][span]
+
+    per_frame: list[dict[str, Any]] = []
+    ambiguities: list[dict[str, Any]] = []
+    for i, (frame_id, _candidates) in enumerate(parsed):
+        feasible: list[int] = []
+        suffix_layer = layers[i]
+        prefix_layer = prefix[i]
+        for d in range(span + 1):
+            suffix_cost = suffix_layer.get(d)
+            if suffix_cost is None:
+                continue
+            prefix_cost = prefix_layer.get(d)
+            if prefix_cost is None:
+                continue
+            # i 之前的缺帧代价只计入前缀，i 之后的只计入后缀，
+            # 第 i 帧命中代价两侧各计一次、扣除一份。
+            if prefix_cost + suffix_cost - match_cost(i, d) == total_cost:
+                feasible.append(first + d)
+        assert feasible, "最优回溯序列中的帧号必然可行"
+        entry = {
+            "position": i + 1,
+            "id": frame_id,
+            "possible_frame_numbers": feasible,
+        }
+        per_frame.append(entry)
+        if len(feasible) > 1:
+            ambiguities.append(entry)
+
+    total_cost_decimal = Decimal(total_cost) / scale
+    return {
+        "first": first,
+        "last": last,
+        "max_missing_between": gap,
+        "frame_count": n,
+        "total_cost": _json_number(total_cost_decimal),
+        "frames": per_frame,
+        "ambiguities": ambiguities,
+        "ambiguity_count": len(ambiguities),
     }
 
 

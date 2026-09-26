@@ -72,6 +72,36 @@ class RescanPlanRequest(BaseModel):
     )
 
 
+class AmbiguityFrameOut(BaseModel):
+    position: int = Field(..., description="扫描顺序位置，从 1 开始")
+    id: FrameId = Field(..., description="扫描帧的唯一标识")
+    possible_frame_numbers: list[int] = Field(
+        ...,
+        description=(
+            "该帧在所有取得全局最低代价的合法序列中可指派的帧号，升序；"
+            "仅一个时帧号已唯一确定，多于一个时需人工核验"
+        ),
+    )
+
+
+class AmbiguityReviewResponse(BaseModel):
+    first: int
+    last: int
+    max_missing_between: int
+    frame_count: int
+    total_cost: Union[int, float] = Field(
+        ..., description="固定首末帧与缺帧上限约束下的全局最低总代价"
+    )
+    frames: list[AmbiguityFrameOut] = Field(
+        ..., description="按扫描位置排列的逐帧可取帧号，possible_frame_numbers 升序"
+    )
+    ambiguities: list[AmbiguityFrameOut] = Field(
+        ...,
+        description="核验清单：possible_frame_numbers 多于一个的帧，按扫描位置升序",
+    )
+    ambiguity_count: int = Field(..., description="核验清单中的帧数")
+
+
 class DiscardedCandidateOut(BaseModel):
     candidate_index: int = Field(..., description="该候选在输入 candidates 中的下标")
     frame_number: int

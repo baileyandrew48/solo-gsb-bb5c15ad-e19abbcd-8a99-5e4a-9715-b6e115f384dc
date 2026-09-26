@@ -6,6 +6,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from app.schemas import (
+    AmbiguityReviewResponse,
     ErrorResponse,
     RescanPlanRequest,
     RescanPlanResponse,
@@ -18,6 +19,7 @@ from app.solver import (
     InvalidRangeError,
     NoFeasibleCombinationError,
     NoFeasibleSequenceError,
+    solve_ambiguity_review,
     solve_rescan_plan,
     solve_review,
     solve_strip_directions,
@@ -33,7 +35,7 @@ app = FastAPI(
         "还可基于复核结果规划复扫窗口：把缺失帧号与推断帧号合并为复扫目标，"
         "划分成固定成本加长度计费的连续窗口，求最低总成本方案。"
     ),
-    version="1.2.0",
+    version="1.3.0",
 )
 
 
@@ -82,6 +84,18 @@ async def health() -> dict[str, str]:
 async def review_frames(request: ReviewRequest) -> ReviewResponse:
     result = solve_review(request.model_dump())
     return ReviewResponse.model_validate(result)
+
+
+@app.post(
+    "/api/v1/ambiguity-reviews",
+    response_model=AmbiguityReviewResponse,
+    tags=["review"],
+    summary="核验扫描帧在所有最低代价序列中的可取帧号",
+    responses={422: {"model": ErrorResponse, "description": "参数非法或无合法序列"}},
+)
+async def review_ambiguities(request: ReviewRequest) -> AmbiguityReviewResponse:
+    result = solve_ambiguity_review(request.model_dump())
+    return AmbiguityReviewResponse.model_validate(result)
 
 
 @app.post(

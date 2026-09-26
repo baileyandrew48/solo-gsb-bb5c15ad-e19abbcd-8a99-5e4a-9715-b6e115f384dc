@@ -13,8 +13,14 @@
 长度受限的连续帧号窗口（每窗成本 = 固定成本 + 窗口帧号数），求覆盖全部
 目标的最低总成本方案。
 
+另有歧义核验接口：接收与逐帧复核完全相同的输入，在同一套约束与代价规则
+下找出全局最低代价，并给出**每一帧在所有最低代价合法序列中可取的帧号**；
+可取帧号多于一个（帧号尚不能唯一确定）的帧按扫描位置列为核验清单，供
+人工确认。
+
 - 语言/框架：Python 3.12 + FastAPI + Pydantic v2
-- 算法：后缀动态规划（单调队列优化 + 字典序同分裁决）+ 方向组合枚举（最多 16 种）
+- 算法：后缀动态规划（单调队列优化 + 字典序同分裁决）+ 前缀动态规划
+  （枚举全部最优序列的可取帧号）+ 方向组合枚举（最多 16 种）
   + 复扫窗口划分动态规划
 - 置信分使用 `Decimal` 精确比较（DP 内部统一放大为整数），避免浮点同分误判
 
@@ -27,12 +33,13 @@ docker compose up --build -d
 ```
 
 一条命令即完成镜像构建、后台启动与健康检查注册，容器内、外端口均为
-`8000`。启动后可直接使用三个接口：
+`8000`。启动后可直接使用四个接口：
 
 - API 地址：`http://localhost:8000`
-- 交互式文档（Swagger UI，三个接口均可在线调试）：<http://localhost:8000/docs>
+- 交互式文档（Swagger UI，四个接口均可在线调试）：<http://localhost:8000/docs>
 - 健康检查：<http://localhost:8000/health>
 - 逐帧复核：`POST http://localhost:8000/api/v1/frame-reviews`
+- 歧义核验：`POST http://localhost:8000/api/v1/ambiguity-reviews`
 - 胶片条方向复核：`POST http://localhost:8000/api/v1/strip-direction-reviews`
 - 复扫窗口规划：`POST http://localhost:8000/api/v1/rescan-plans`
 
@@ -48,6 +55,7 @@ docker compose down
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `POST` | `/api/v1/frame-reviews` | 逐帧复核：单条扫描序列的帧号指派 |
+| `POST` | `/api/v1/ambiguity-reviews` | 歧义核验：各帧在所有最低代价合法序列中的可取帧号与核验清单 |
 | `POST` | `/api/v1/strip-direction-reviews` | 胶片条方向复核：2～4 条胶片条的方向选择与帧号指派 |
 | `POST` | `/api/v1/rescan-plans` | 复扫窗口规划：把缺失/推断帧号划分为最低成本的连续窗口 |
 
@@ -162,6 +170,97 @@ curl -s -X POST http://localhost:8000/api/v1/frame-reviews \
 #### 无合法序列示例
 
 帧号区间无法容纳全部扫描帧（如 3 帧却只给了 2 个帧号）：
+
+```json
+{
+  "error": "no_feasible_sequence",
+  "message": "帧号区间 [1, 2] 只有 2 个帧号，无法为 3 帧指派严格递增的帧号"
+}
+```
+
+### `POST /api/v1/ambiguity-reviews`
+
+供**人工核验**尚不能唯一确定帧号的扫描帧。请求体与逐帧复核**完全相同**
+（`first` / `last` / `max_missing_between` / `frames`，字段含义与校验
+规则一致，此处不再列出），在固定首末帧、相邻缺帧上限与相同的候选/缺帧
+代价规则下：
+
+- 返回全局**最低总代价** `total_cost`（与逐帧复核的最优总代价一致）；
+- 对每一帧给出它在**所有**取得该最低代价的合法序列中可以指派的帧号
+  `possible_frame_numbers`（升序）；只有一个值时帧号已被唯一确定，
+  多于一个值时该帧存在歧义、需要人工核验；
+- `ambiguities` 是核验清单：把可取帧号多于一个的帧按**扫描位置**列出，
+  每项含 `position`、`id`、`possible_frame_numbers`，
+  `ambiguity_count` 为清单长度；无歧义时为空数组、计数为 `0`。
+
+同分比较沿用现有 `Decimal` 精度规则（置信分带小数时按实际小数位精确
+比较），因此可能存在多条严格同代价的最优序列；本接口枚举的是全部最优
+序列的可取帧号，而**不是**只返回逐帧复核按字典序裁决出的单条首解。
+无合法序列时沿用逐帧复核的 HTTP `422`（`no_feasible_sequence`），
+参数非法为 `invalid_range`。
+
+#### 请求示例
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/ambiguity-reviews \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "first": 1,
+    "last": 6,
+    "max_missing_between": 1,
+    "frames": [
+      {"id": "scan-001", "candidates": []},
+      {"id": "scan-002", "candidates": [
+        {"frame_number": 2, "confidence": 80.4},
+        {"frame_number": 3, "confidence": 40.2}
+      ]},
+      {"id": "scan-003", "candidates": [{"frame_number": 5, "confidence": 40.2}]},
+      {"id": "scan-004", "candidates": []}
+    ]
+  }'
+```
+
+该例有两条严格同代价（`379.6`）的最优合法序列
+`[1, 2, 4, 6]` 与 `[1, 3, 5, 6]`：前者 scan-002 命中帧号 2
+（代价 19.6）、scan-003 推断为帧号 4；后者 scan-002 命中帧号 3、
+scan-003 命中帧号 5（命中代价均为 59.8）。两条序列的命中收益之差恰好
+被缺帧代价抵消，故 scan-002 可取 2 或 3、scan-003 可取 4 或 5。
+
+#### 响应示例
+
+```json
+{
+  "first": 1,
+  "last": 6,
+  "max_missing_between": 1,
+  "frame_count": 4,
+  "total_cost": 379.6,
+  "frames": [
+    {"position": 1, "id": "scan-001", "possible_frame_numbers": [1]},
+    {"position": 2, "id": "scan-002", "possible_frame_numbers": [2, 3]},
+    {"position": 3, "id": "scan-003", "possible_frame_numbers": [4, 5]},
+    {"position": 4, "id": "scan-004", "possible_frame_numbers": [6]}
+  ],
+  "ambiguities": [
+    {"position": 2, "id": "scan-002", "possible_frame_numbers": [2, 3]},
+    {"position": 3, "id": "scan-003", "possible_frame_numbers": [4, 5]}
+  ],
+  "ambiguity_count": 2
+}
+```
+
+字段说明：
+
+- `total_cost`：约束下的全局最低总代价（候选代价 + 缺帧代价，口径同
+  逐帧复核）；
+- `frames[].possible_frame_numbers`：该帧在所有最低代价合法序列中可取
+  的帧号，升序；首帧恒为 `[first]`、末帧恒为 `[last]`；
+- `ambiguities` / `ambiguity_count`：核验清单，即
+  `possible_frame_numbers` 多于一个的帧，按扫描位置升序排列。
+
+#### 无合法序列示例
+
+与逐帧复核相同：
 
 ```json
 {
@@ -452,6 +551,13 @@ match(i, d) = 100 - 置信分   若该帧存在帧号 first+d 的候选
   O(n · span)；方向组合最多 16 个；
 - 回溯时在保持最优代价的前提下每一步选最小偏移量，后缀最优与历史无关，
   因此贪心回溯得到的就是字典序最小的最优帧号序列；
+- 歧义核验除后缀 DP 外再对称地计算前缀 DP（`_prefix_layers`，扫描方向
+  相反、同样用单调队列优化，单层 O(span)）：`P[i][d]` 为第 0..i 帧且
+  第 i 帧取 d 时的最小代价。第 i 帧取 `first+d` 能出现在某条全局最优
+  序列中，当且仅当 `P[i][d] + S[i][d] - match(i,d)` 等于全局最优
+  （第 i 帧命中代价被前后缀各计一次，扣除一份）。逐 offset 枚举即可
+  得到每帧在**所有**最优序列中的可取帧号，整体复杂度仍为
+  O(n · span)；整数缩放保证小数置信分严格同分也不会漏判；
 - 胶片条方向复核把每条按候选方向翻转后拼接（条间顺序不变），对每个方向
   向量跑一次上述 DP，再按“总代价 → 倒序条数 → 方向向量 → 帧号序列”
   逐级取字典序最小。
