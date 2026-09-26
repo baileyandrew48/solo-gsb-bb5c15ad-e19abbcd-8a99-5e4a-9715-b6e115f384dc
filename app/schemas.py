@@ -116,6 +116,43 @@ class ReviewResponse(BaseModel):
     frames: list[FrameAssignmentOut]
 
 
+class AmbiguousFrameOut(BaseModel):
+    position: int = Field(..., description="扫描顺序位置，从 1 开始")
+    id: FrameId
+    possible_frame_numbers: list[int] = Field(
+        ...,
+        description="该帧在所有最低代价合法序列中可取得的帧号，升序",
+        min_length=1,
+    )
+
+
+class AmbiguityReviewItemOut(BaseModel):
+    position: int = Field(..., description="扫描顺序位置，从 1 开始")
+    id: FrameId
+    possible_frame_numbers: list[int] = Field(
+        ...,
+        description="该帧在所有最低代价合法序列中可取得的帧号（多于一个），升序",
+        min_length=2,
+    )
+
+
+class AmbiguityReviewResponse(BaseModel):
+    first: int
+    last: int
+    max_missing_between: int
+    frame_count: int
+    total_cost: Union[int, float] = Field(
+        ..., description="与逐帧复核一致的全局最低代价"
+    )
+    frames: list[AmbiguousFrameOut] = Field(
+        ..., description="按扫描位置逐帧给出可取帧号升序列表"
+    )
+    review_checklist: list[AmbiguityReviewItemOut] = Field(
+        ...,
+        description="可取帧号多于一个、需要人工核验的帧，按扫描位置升序",
+    )
+
+
 class StripAssignmentOut(BaseModel):
     index: int = Field(..., description="胶片条序号，从 1 开始（条间顺序固定）")
     direction: Literal[0, 1] = Field(

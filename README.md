@@ -13,6 +13,10 @@
 长度受限的连续帧号窗口（每窗成本 = 固定成本 + 窗口帧号数），求覆盖全部
 目标的最低总成本方案。
 
+另有歧义核验接口：输入与逐帧复核完全相同，但不只返回字典序最小的一条
+最优解，而是给出**每帧在所有最低代价合法序列中可取得的帧号**，并把不能
+唯一确定帧号的帧整理成核验清单，供人工逐条确认。
+
 - 语言/框架：Python 3.12 + FastAPI + Pydantic v2
 - 算法：后缀动态规划（单调队列优化 + 字典序同分裁决）+ 方向组合枚举（最多 16 种）
   + 复扫窗口划分动态规划
@@ -27,12 +31,13 @@ docker compose up --build -d
 ```
 
 一条命令即完成镜像构建、后台启动与健康检查注册，容器内、外端口均为
-`8000`。启动后可直接使用三个接口：
+`8000`。启动后可直接使用四个接口：
 
 - API 地址：`http://localhost:8000`
-- 交互式文档（Swagger UI，三个接口均可在线调试）：<http://localhost:8000/docs>
+- 交互式文档（Swagger UI，四个接口均可在线调试）：<http://localhost:8000/docs>
 - 健康检查：<http://localhost:8000/health>
 - 逐帧复核：`POST http://localhost:8000/api/v1/frame-reviews`
+- 歧义核验：`POST http://localhost:8000/api/v1/ambiguity-reviews`
 - 胶片条方向复核：`POST http://localhost:8000/api/v1/strip-direction-reviews`
 - 复扫窗口规划：`POST http://localhost:8000/api/v1/rescan-plans`
 
@@ -48,6 +53,7 @@ docker compose down
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `POST` | `/api/v1/frame-reviews` | 逐帧复核：单条扫描序列的帧号指派 |
+| `POST` | `/api/v1/ambiguity-reviews` | 歧义核验：每帧在所有最低代价合法序列中的可取帧号 |
 | `POST` | `/api/v1/strip-direction-reviews` | 胶片条方向复核：2～4 条胶片条的方向选择与帧号指派 |
 | `POST` | `/api/v1/rescan-plans` | 复扫窗口规划：把缺失/推断帧号划分为最低成本的连续窗口 |
 
@@ -169,6 +175,71 @@ curl -s -X POST http://localhost:8000/api/v1/frame-reviews \
   "message": "帧号区间 [1, 2] 只有 2 个帧号，无法为 3 帧指派严格递增的帧号"
 }
 ```
+
+### `POST /api/v1/ambiguity-reviews`
+
+用于人工核验尚不能唯一确定帧号的扫描帧。**请求体与逐帧复核完全相同**
+（同样的 `first` / `last` / `max_missing_between` / `frames` 字段与校验
+规则，可直接复用逐帧复核的请求 JSON），首末帧固定、相邻缺帧上限、候选/
+缺帧代价与全局最优规则也完全一致。
+
+与逐帧复核的区别：逐帧复核在同代价时只回溯出**字典序最小的一条**最优
+序列；本接口则枚举全部最优合法序列，给出每帧在其中可取得的**所有**帧号
+（按整数放大后的精确代价比较，小数置信分同分不会被漏判，不存在浮点误差，
+也不是仅返回字典序首解）。
+
+#### 请求示例
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/ambiguity-reviews \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "first": 10,
+    "last": 16,
+    "max_missing_between": 2,
+    "frames": [
+      {"id": "scan-001", "candidates": [{"frame_number": 10, "confidence": 95}]},
+      {"id": "scan-002", "candidates": [{"frame_number": 11, "confidence": 90}]},
+      {"id": "scan-003", "candidates": []},
+      {"id": "scan-004", "candidates": [{"frame_number": 16, "confidence": 85}]}
+    ]
+  }'
+```
+
+#### 响应示例
+
+`scan-003` 没有候选、按推断计代价 100：无论取 13 还是 14，其后到 16 的
+缺帧总数不变（整条序列固定缺 3 帧），两条序列总代价同为最低值 220。
+
+```json
+{
+  "first": 10,
+  "last": 16,
+  "max_missing_between": 2,
+  "frame_count": 4,
+  "total_cost": 220,
+  "frames": [
+    {"position": 1, "id": "scan-001", "possible_frame_numbers": [10]},
+    {"position": 2, "id": "scan-002", "possible_frame_numbers": [11]},
+    {"position": 3, "id": "scan-003", "possible_frame_numbers": [13, 14]},
+    {"position": 4, "id": "scan-004", "possible_frame_numbers": [16]}
+  ],
+  "review_checklist": [
+    {"position": 3, "id": "scan-003", "possible_frame_numbers": [13, 14]}
+  ]
+}
+```
+
+字段说明：
+
+- `total_cost`：与逐帧复核一致的全局最低代价（候选代价 + 缺帧代价）；
+- `frames[].possible_frame_numbers`：该帧在**所有最低代价合法序列**中可
+  取得的帧号，升序排列；首帧恒为 `[first]`、末帧恒为 `[last]`；
+- `review_checklist`：可取帧号多于一个的帧，即无法由代价规则唯一确定、
+  需要人工核验的帧，按扫描位置 `position` 升序，含位置、帧 `id` 与可取
+  帧号；全部帧都唯一时为空数组。
+- 无合法序列时沿用逐帧复核的 HTTP `422` 响应，错误码为
+  `invalid_range` / `no_feasible_sequence`，结构同上。
 
 ### `POST /api/v1/strip-direction-reviews`
 
@@ -452,6 +523,13 @@ match(i, d) = 100 - 置信分   若该帧存在帧号 first+d 的候选
   O(n · span)；方向组合最多 16 个；
 - 回溯时在保持最优代价的前提下每一步选最小偏移量，后缀最优与历史无关，
   因此贪心回溯得到的就是字典序最小的最优帧号序列；
+- 歧义核验（`/api/v1/ambiguity-reviews`）再对称地计算前缀 DP：
+  `prefix[i][d]` 表示第 i 帧取 `first+d` 时第 0..i 帧的最小代价（同样用
+  单调队列、O(n·span)）。帧 i 取偏移 d 能出现在某条全局最优合法序列中，
+  当且仅当 `prefix[i][d] + suffix[i][d] - match(i,d) = 全局最优代价`
+  （拼接处的 match 代价被前缀、后缀各计一次，故减去一份）。枚举满足该
+  等式的偏移即得到每帧的全部可取帧号，比较全程在整数缩放域完成，小数
+  置信分的同分判定与逐帧复核完全一致；
 - 胶片条方向复核把每条按候选方向翻转后拼接（条间顺序不变），对每个方向
   向量跑一次上述 DP，再按“总代价 → 倒序条数 → 方向向量 → 帧号序列”
   逐级取字典序最小。

@@ -21,6 +21,12 @@
 source=inferred 帧的指派帧号合并去重为复扫目标，再划分成互不重叠、
 长度受限的连续帧号窗口，按总成本、窗口数、起止点序列依次裁决。
 
+歧义核验（:func:`solve_ambiguity_review`）复用同一后缀 DP，再补一个对称
+的前缀 DP：帧 i 取偏移 d 能出现在某个全局最优合法序列中，当且仅当
+``prefix[i][d] + suffix[i][d] - match_cost(i, d)`` 等于全局最优代价。
+据此给出每帧在**所有**最优合法序列中可取得的帧号集合，而不是仅回溯出
+字典序最小的一条。
+
 实现思路
 --------
 令 span = last - first，第 i 帧（0-based）指派到 first + d_i。
@@ -328,9 +334,70 @@ def _solve_assignment(
 
     total_cost = layers[0][0]
 
-    # ---- 回溯：在最优代价前提下每一步取最小 offset ----
-    # nd 从小到大遍历且只在严格更小时替换，同分自然保留最小值；
-    # 后缀最优与历史无关，因此贪心得到全局字典序最小的最优序列。
+    # 对称的前缀 DP：prefix[i][d] = 第 i 帧取 offset d 时，第 0..i 帧的
+    # 最小总代价（不含 i 之后的缺帧代价）。第一帧固定 offset 0。
+    prefix = _prefix_layers(n, span, max_step, penalty_scaled, match_cost)
+
+    return {
+        "first": first,
+        "last": last,
+        "gap": gap,
+        "span": span,
+        "n": n,
+        "parsed": parsed,
+        "best_by_frame": best_by_frame,
+        "offsets": _backtrack_offsets(layers, span, max_step, penalty_scaled),
+        "total_cost": total_cost,
+        "cost_scale": scale,
+        "suffix_layers": layers,
+        "prefix_layers": prefix,
+        "match_cost_fn": match_cost,
+    }
+
+
+def _prefix_layers(
+    n: int,
+    span: int,
+    max_step: int,
+    penalty_scaled: int,
+    match_cost: Any,
+) -> list[dict[int, int]]:
+    prefix: list[dict[int, int]] = [dict() for _ in range(n)]
+    prefix[0][0] = match_cost(0, 0)
+    for i in range(1, n):
+        layer: dict[int, int] = {}
+        # 单调队列元素 (offset, key)，按 d 从小到大扫描：
+        # - 新 offset（前驱 d-1）从队尾加入，过小（出窗）的从队首淘汰；
+        # - key = -30*offset + prefix[i-1][offset]，队首到队尾严格递增，
+        #   队首即前驱窗口最小值。
+        queue: deque[tuple[int, int]] = deque()
+        prev_layer = prefix[i - 1]
+        for d in range(1, span + 1):
+            added = d - 1
+            prev = prev_layer.get(added)
+            if prev is not None:
+                key = -penalty_scaled * added + prev
+                while queue and queue[-1][1] >= key:
+                    queue.pop()
+                queue.append((added, key))
+            # 窗口下界为 d - max_step，丢掉 offset 过小的队首
+            if queue and queue[0][0] < d - max_step:
+                queue.popleft()
+            if queue:
+                best_transition = queue[0][1] + penalty_scaled * (d - 1)
+                layer[d] = match_cost(i, d) + best_transition
+        prefix[i] = layer
+    return prefix
+
+
+def _backtrack_offsets(
+    layers: list[dict[int, int]],
+    span: int,
+    max_step: int,
+    penalty_scaled: int,
+) -> list[int]:
+    """在后缀 DP 上回溯字典序最小的最优指派偏移序列。"""
+    n = len(layers)
     offsets: list[int] = [0]
     for i in range(n - 1):
         d = offsets[-1]
@@ -351,19 +418,7 @@ def _solve_assignment(
                 f"回溯到第 {i + 1} 帧时找不到合法后继帧号"
             )
         offsets.append(chosen)
-
-    return {
-        "first": first,
-        "last": last,
-        "gap": gap,
-        "span": span,
-        "n": n,
-        "parsed": parsed,
-        "best_by_frame": best_by_frame,
-        "offsets": offsets,
-        "total_cost": total_cost,
-        "cost_scale": scale,
-    }
+    return offsets
 
 
 # ---- 逐帧结果与代价明细 ----
@@ -538,6 +593,89 @@ def solve_review(payload: dict[str, Any]) -> dict[str, Any]:
         "missing_frame_count": len(missing_frame_numbers),
         "discarded_candidate_count": total_discarded,
         "frames": result_frames,
+    }
+
+
+def solve_ambiguity_review(payload: dict[str, Any]) -> dict[str, Any]:
+    """列出每帧在所有全局最优合法序列中可取得的帧号，供人工核验歧义。
+
+    入参与 :func:`solve_review` 完全相同（复用同一请求校验与 DP）。
+    区别在于不再只回溯字典序最小的一条最优序列，而是结合前缀 DP 与
+    后缀 DP 求每帧的可达最优帧号集合：
+
+        prefix[i][d] + suffix[i][d] - match_cost(i, d) == 全局最优代价
+
+    成立当且仅当存在一条总代价最优的合法序列使第 i 帧取 first + d。
+    所有比较都在按置信分小数位放大后的整数域进行，同分判定与逐帧复核
+    完全一致，不会因浮点或仅取单一回溯解而漏报歧义。
+
+    返回全局最低代价、每帧可取帧号升序列表，以及可取帧号多于一个的帧
+    按扫描位置组成的核验清单。错误语义同 solve_review。
+    """
+    frames = payload.get("frames")
+    if not isinstance(frames, list) or not (MIN_FRAMES <= len(frames) <= MAX_FRAMES):
+        raise InvalidRangeError(
+            f"frames 数量必须在 {MIN_FRAMES}～{MAX_FRAMES} 之间"
+        )
+
+    first, last, gap = _validate_endpoints(payload)
+    parsed = _parse_frames(frames)
+    solution = _solve_assignment(first, last, gap, parsed)
+
+    n = solution["n"]
+    total_cost_scaled = solution["total_cost"]
+    scale = solution["cost_scale"]
+    prefix_layers = solution["prefix_layers"]
+    suffix_layers = solution["suffix_layers"]
+    match_cost = solution["match_cost_fn"]
+
+    result_frames: list[dict[str, Any]] = []
+    review_checklist: list[dict[str, Any]] = []
+
+    for i, (frame_id, _candidates) in enumerate(parsed):
+        prefix_layer = prefix_layers[i]
+        suffix_layer = suffix_layers[i]
+        possible_offsets: list[int] = []
+        # 前缀层的键即可参与拼接的偏移；逐一套用最优拼接等式，键顺序天然升序
+        for d, prefix_cost in prefix_layer.items():
+            suffix_cost = suffix_layer.get(d)
+            if suffix_cost is None:
+                continue
+            if prefix_cost + suffix_cost - match_cost(i, d) == total_cost_scaled:
+                possible_offsets.append(d)
+
+        if not possible_offsets:
+            # 字典序最优回溯路径上的偏移必然满足等式，故每帧至少一个可取帧号
+            raise NoFeasibleSequenceError(
+                f"第 {i + 1} 帧在最优序列中没有可取帧号"
+            )
+
+        possible_numbers = [first + d for d in possible_offsets]
+        result_frames.append(
+            {
+                "position": i + 1,
+                "id": frame_id,
+                "possible_frame_numbers": possible_numbers,
+            }
+        )
+        if len(possible_numbers) > 1:
+            review_checklist.append(
+                {
+                    "position": i + 1,
+                    "id": frame_id,
+                    "possible_frame_numbers": possible_numbers,
+                }
+            )
+
+    total_cost = Decimal(total_cost_scaled) / scale
+    return {
+        "first": first,
+        "last": last,
+        "max_missing_between": gap,
+        "frame_count": n,
+        "total_cost": _json_number(total_cost),
+        "frames": result_frames,
+        "review_checklist": review_checklist,
     }
 
 
